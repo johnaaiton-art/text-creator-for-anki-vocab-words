@@ -80,9 +80,10 @@ WORD_COUNTS = {
 
 # Audio speed by level
 AUDIO_SPEEDS = {
+    'C2': 1.0,   # 100%
     'C1': 1.0,   # 100%
-    'B2': 0.85,  # 85%
-    'B1': 0.85,  # 85%
+    'B2': 0.90,  # 90%
+    'B1': 0.90,  # 90%
     'A2': 0.70,  # 70%
     'A1': 0.70   # 70%
 }
@@ -167,21 +168,57 @@ def parse_anki_export(text: str) -> List[str]:
 
 
 def parse_column(text: str, column_num: int) -> List[str]:
-    """Parse specific column from tab-delimited text"""
+    """Parse specific column from AnkiDroid or tab-delimited text.
+    Handles BOM, #separator headers, tabs, and multi-space delimiters."""
+    # Remove BOM if present
+    text = text.lstrip('\ufeff')
     lines = text.split('\n')
     words = []
-    
+
+    # Detect delimiter from Anki header if present
+    delimiter = '\t'  # default
+    for line in lines[:5]:
+        ls = line.strip()
+        if ls.startswith('#separator:'):
+            sep_value = ls.split(':', 1)[1].strip().lower()
+            if sep_value == 'tab':
+                delimiter = '\t'
+            elif sep_value == 'space':
+                delimiter = ' '
+            break
+
+    # Auto-detect if no header: check first real data line
+    else:
+        for line in lines:
+            ls = line.strip()
+            if not ls or ls.startswith('#'):
+                continue
+            if '\t' in ls:
+                delimiter = '\t'
+            else:
+                delimiter = 'spaces'  # 2+ spaces fallback
+            break
+
     for line in lines:
         line = line.strip()
         if not line or line.startswith('#'):
             continue
-        
-        parts = line.split('\t')
+
+        if delimiter == 'spaces':
+            parts = re.split(r'  +', line)
+        else:
+            parts = line.split(delimiter)
+
+        parts = [p.strip() for p in parts]
+
         if len(parts) >= column_num:
             word = parts[column_num - 1].strip()
             if word:
                 words.append(word)
-    
+        else:
+            logger.debug(f"Line has {len(parts)} cols (need {column_num}): {line[:60]}")
+
+    logger.info(f"parse_column: {len(words)} words from col {column_num}, delimiter={repr(delimiter)}")
     return words
 
 
@@ -256,7 +293,8 @@ Return ONLY valid JSON, no other text."""
 
 def create_html_with_highlights(text: str, words_used: List[str]) -> str:
     """Create HTML with highlighted vocabulary words"""
-    html_text = text
+    # Strip any markdown bold markers (**word**) before processing
+    html_text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     
     # Sort words by length (longest first) to avoid partial matches
     sorted_words = sorted(words_used, key=len, reverse=True)
@@ -264,7 +302,7 @@ def create_html_with_highlights(text: str, words_used: List[str]) -> str:
     for word in sorted_words:
         # Use word boundaries and case-insensitive matching
         pattern = re.compile(r'\b' + re.escape(word) + r'\w*\b', re.IGNORECASE)
-        html_text = pattern.sub(lambda m: f'<b>{m.group()}</b>', html_text)
+        html_text = pattern.sub(lambda m: f'<span class="vocab">{m.group()}</span>', html_text)
     
     html_template = f"""<!DOCTYPE html>
 <html>
@@ -286,9 +324,8 @@ def create_html_with_highlights(text: str, words_used: List[str]) -> str:
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }}
-        b {{
+        .vocab {{
             color: #2563eb;
-            font-weight: 600;
         }}
         p {{
             margin-bottom: 1.5em;
@@ -307,8 +344,9 @@ def create_html_with_highlights(text: str, words_used: List[str]) -> str:
 
 def generate_audio(text: str, language: str, level: str) -> bytes:
     """Generate audio using Google TTS with appropriate speed"""
-    # Remove HTML tags for audio
+    # Remove HTML tags and markdown bold markers for audio
     clean_text = re.sub('<[^<]+?>', '', text)
+    clean_text = re.sub(r'\*\*(.+?)\*\*', r'\1', clean_text)
     
     # Select random voice
     voice_name = random.choice(CHIRP_VOICES[language])
@@ -391,7 +429,15 @@ def handle_message(message):
             words = parse_column(session.raw_text, column_num)
             
             if not words:
-                bot.reply_to(message, "No words found in that column. Please try again.")
+                # Give user diagnostic info
+                lines = session.raw_text.lstrip('\ufeff').split('\n')
+                first_real = next((l for l in lines if l.strip() and not l.strip().startswith('#')), '')
+                tab_count = first_real.count('\t')
+                bot.reply_to(message, 
+                    f"No words found in column {column_num}.\n\n"
+                    f"First data line has {tab_count} tab(s):\n`{first_real[:100]}`\n\n"
+                    f"Try column 1, or check if your file uses tabs.",
+                    parse_mode="Markdown")
                 return
             
             session.words = words
@@ -461,8 +507,8 @@ def handle_message(message):
             bot.send_document(message.chat.id, html_file, 
                 caption=f"✅ Used {len(words_used)} vocabulary words:\n{', '.join(words_used)}")
             
-            # Generate and send audio (only for C1 and below)
-            if session.level != 'C2':
+            # Generate and send audio (all levels including C2)
+            if session.level != 'NEVER':  # always generate audio
                 bot.send_message(message.chat.id, "Generating audio... 🔊")
                 audio_content = generate_audio(generated_text, session.language, session.level)
                 audio_file = io.BytesIO(audio_content)
