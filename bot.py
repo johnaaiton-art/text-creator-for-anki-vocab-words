@@ -1,4 +1,4 @@
-﻿import os
+import os
 import logging
 import random
 import json
@@ -15,6 +15,10 @@ from openai import OpenAI
 from google.cloud import texttospeech
 from google.oauth2 import service_account
 import langdetect
+import hashlib
+import threading
+from datetime import datetime
+from googleapiclient.discovery import build
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +31,9 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 GOOGLE_CREDS_PATH = os.getenv('GOOGLE_CREDS_PATH', '/home/user/google-creds.json')
+
+TRACKING_SHEET_ID = os.getenv('TRACKING_SHEET_ID', '')
+SPEAKING_SESSIONS_DIR = 'speaking_sessions'
 
 # Initialize bot
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -112,6 +119,11 @@ class UserSession:
         self.raw_text: Optional[str] = None
         self.awaiting_column: bool = False
         self.awaiting_confirmation: bool = False
+        self.speak_questions = []
+        self.speak_index: int = 0
+        self.speak_lang: str = 'en'
+        self.awaiting_speak_lang: bool = False
+        self._pending_speak_data = None
 
 
 def detect_language(words: List[str]) -> str:
@@ -165,6 +177,24 @@ def parse_anki_export(text: str) -> List[str]:
             words.append(parts[0].strip())
     
     return words
+
+
+def parse_numbered_mixed(text: str) -> List[str]:
+    """Parse format: 1get caught upувлекаться -> English only"""
+    cyrillic = re.compile(r'[Ѐ-ӿ]')
+    lines = text.strip().split('\n')
+    results = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r'^\d+', '', line).strip()
+        match = cyrillic.search(line)
+        if match:
+            line = line[:match.start()].strip()
+        if line:
+            results.append(line)
+    return results
 
 
 def parse_column(text: str, column_num: int) -> List[str]:
@@ -421,7 +451,12 @@ def handle_message(message):
         user_sessions[user_id] = UserSession()
     
     session = user_sessions[user_id]
-    
+
+    # Handle speaking language selection
+    if session.awaiting_speak_lang and text in ('Spanish', 'English'):
+        _start_speaking(message.chat.id, user_id, session._pending_speak_data, text)
+        return
+
     # Handle column number input
     if session.awaiting_column:
         try:
@@ -517,10 +552,22 @@ def handle_message(message):
                 bot.send_audio(message.chat.id, audio_file, 
                     caption=f"🎧 Audio at {speed_percent}% speed")
             
-            # Clear session
+            # Save speaking session to disk
+            save_speaking_session(user_id, {
+                "topic": session.topic,
+                "words_used": words_used,
+                "level": session.level,
+                "language": session.language,
+            })
+            threading.Thread(target=track_usage, args=(
+                user_id, message.from_user.username,
+                message.from_user.first_name, session.topic,
+                session.level, session.language
+            ), daemon=True).start()
             user_sessions.pop(user_id, None)
-            bot.send_message(message.chat.id, 
-                "Done! 🎉\n\nSend me another vocabulary list when you're ready.")
+            bot.send_message(message.chat.id,
+                "Done! 🎉\n\nWhen you've done your Anki cards and listened to the audio, "
+                "send /speak to practise reacting to ideas in the text.")
             
         except Exception as e:
             logger.error(f"Error in generation: {e}")
@@ -531,8 +578,11 @@ def handle_message(message):
         return
     
     # Handle plain text paste (no file)
-    if not session.raw_text and '\n' in text:
-        words = [line.strip() for line in text.split('\n') if line.strip()]
+    if not session.raw_text and ('\n' in text or re.search(r'[\u0400-\u04FF]', text)):
+        if re.search(r'[\u0400-\u04FF]', text):
+            words = parse_numbered_mixed(text)
+        else:
+            words = [line.strip() for line in text.split('\n') if line.strip()]
         session.words = words
         session.language = detect_language(words)
         session.words = filter_words(words, session.language)
@@ -547,6 +597,245 @@ def handle_message(message):
     # Default response
     bot.reply_to(message, 
         "Please send me a .txt file or paste your vocabulary words (one per line).")
+
+
+
+# === SPEAKING MODE ===
+
+def save_speaking_session(user_id, data):
+    os.makedirs(SPEAKING_SESSIONS_DIR, exist_ok=True)
+    path = os.path.join(SPEAKING_SESSIONS_DIR, f"{user_id}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_speaking_session(user_id):
+    path = os.path.join(SPEAKING_SESSIONS_DIR, f"{user_id}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def track_usage(user_id, username, first_name, topic, level, language):
+    if not TRACKING_SHEET_ID:
+        return
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            GOOGLE_CREDS_PATH,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        service = build("sheets", "v4", credentials=creds)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        row = [[timestamp, str(user_id), username or "", first_name or "", topic[:50], level, language]]
+        service.spreadsheets().values().append(
+            spreadsheetId=TRACKING_SHEET_ID,
+            range="VLS!A:G",
+            valueInputOption="RAW",
+            body={"values": row}
+        ).execute()
+    except Exception as e:
+        logger.error(f"[Tracking] {e}")
+
+def generate_speaking_questions(topic, words_used, level, language):
+    lang_names = {"en": "English", "es": "Spanish", "zh": "Chinese (Mandarin)"}
+    lang_name = lang_names.get(language, "English")
+    if level in ("A1", "A2"):
+        patterns = ["Do you agree that [idea]?", "Is it true for you that [idea]?", "Do you know anyone who [idea]?"]
+    elif level in ("B1", "B2"):
+        patterns = ["Do you agree that [idea]?", "To what extent has [idea] been true in your experience?",
+                    "Would you say that [idea]?", "Is [idea] realistic in your view?"]
+    else:
+        patterns = ["To what extent do you think [idea]?",
+                    "Would you argue that [idea], or is this an oversimplification?",
+                    "How far has [idea] been true in your own experience?",
+                    "Is the claim that [idea] realistic, in your view?"]
+    vocab_str = ", ".join(f'"{w}"' for w in words_used[:20])
+    patterns_str = "\n".join(f"- {p}" for p in patterns)
+    prompt = f"""You are a language speaking coach for a {level} {lang_name} learner.
+Topic: {topic}
+Target expressions: {vocab_str}
+
+Create exactly 5 speaking questions in {lang_name}. Each must:
+1. React to a SPECIFIC idea from the text (not a tangent)
+2. Use 1-3 target expressions naturally inside the question
+3. Be appropriate for {level} level
+4. Use one of these patterns:
+{patterns_str}
+5. Prompt a personal reaction, not just yes/no
+
+Return ONLY valid JSON:
+{{"questions": [{{"question": "...", "target_expressions": ["expr1"]}}]}}"""
+    try:
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "system", "content": "Language coach. Return only valid JSON."},
+                       {"role": "user", "content": prompt}],
+            temperature=0.7, timeout=45.0
+        )
+        text = response.choices[0].message.content.strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            text = match.group()
+        return json.loads(text).get("questions", [])[:5]
+    except Exception as e:
+        logger.error(f"[Speak] Questions failed: {e}")
+        return []
+
+def generate_speaking_feedback(question, target_expressions, user_text, level, language):
+    lang_names = {"en": "English", "es": "Spanish", "zh": "Chinese"}
+    lang_name = lang_names.get(language, "English")
+    targets = ", ".join(f'"{e}"' for e in target_expressions)
+    prompt = f"""Brief {lang_name} speaking coach for {level} learners.
+Question: {question}
+Target expression(s): {targets}
+Student said: {user_text}
+
+Respond in under 60 words, warm tone:
+1. ERROR (optional): one obvious error only, omit if none
+2. SCORE: X/5 - how flexibly they used the target (5=creative, 4=natural, 3=mechanical, 2=awkward, 1=not used)
+3. TIP: try "[one concrete rewrite showing more flexible use]"
+   verb phrase -> add adverb or shift tense
+   adj+noun -> add second adjective with "and"
+   prediction -> hedge with "unlikely to" or "bound to"
+   any -> try conditional or negation"""
+    try:
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "system", "content": "Brief language coach. Under 60 words."},
+                       {"role": "user", "content": prompt}],
+            temperature=0.6, timeout=30.0
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"[Speak] Feedback failed: {e}")
+        return "Good effort! Keep going."
+
+def transcribe_voice_stt(audio_path, language):
+    lang_codes = {"en": "en-US", "es": "es-ES", "zh": "cmn-CN"}
+    lang_code = lang_codes.get(language, "en-US")
+    try:
+        from google.cloud import speech as google_speech
+        creds = service_account.Credentials.from_service_account_file(
+            GOOGLE_CREDS_PATH,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        client = google_speech.SpeechClient(credentials=creds)
+        with open(audio_path, "rb") as f:
+            audio_data = f.read()
+        response = client.recognize(
+            config=google_speech.RecognitionConfig(
+                encoding=google_speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
+                sample_rate_hertz=48000,
+                language_code=lang_code,
+            ),
+            audio=google_speech.RecognitionAudio(content=audio_data)
+        )
+        if response.results:
+            return response.results[0].alternatives[0].transcript
+    except Exception as e:
+        logger.error(f"[STT] {e}")
+    return None
+
+def send_speak_question(chat_id, session):
+    idx = session.speak_index
+    qs  = session.speak_questions
+    if idx >= len(qs):
+        bot.send_message(chat_id, "Speaking practice complete! Great work.\n\nSend a new vocabulary list any time.")
+        session.speak_questions = []
+        session.speak_index = 0
+        return
+    q = qs[idx]
+    targets = q.get("target_expressions", [])
+    bot.send_message(chat_id,
+        f"Question {idx+1}/{len(qs)}\n\n"
+        f"\U0001f4ac {q['question']}\n\n"
+        f"\U0001f3af Target: {', '.join(targets)}\n\n"
+        f"Reply with a voice message \U0001f3a4"
+    )
+
+@bot.message_handler(commands=["speak"])
+def handle_speak_command(message):
+    user_id = message.from_user.id
+    session_data = load_speaking_session(user_id)
+    if not session_data:
+        bot.reply_to(message,
+            "No previous session found. Send me a vocabulary list and topic first, "
+            "then use /speak when ready.")
+        return
+    detected_lang = session_data.get("language", "en")
+    if detected_lang == "es":
+        if user_id not in user_sessions:
+            user_sessions[user_id] = UserSession()
+        s = user_sessions[user_id]
+        s.awaiting_speak_lang = True
+        s._pending_speak_data = session_data
+        markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+        markup.row("Spanish", "English")
+        bot.reply_to(message,
+            "I detected Spanish vocabulary. Should questions be in Spanish or English?",
+            reply_markup=markup)
+        return
+    _start_speaking(message.chat.id, user_id, session_data, detected_lang)
+
+def _start_speaking(chat_id, user_id, session_data, speak_lang):
+    lang_map = {"Spanish": "es", "English": "en"}
+    if speak_lang in lang_map:
+        speak_lang = lang_map[speak_lang]
+    topic      = session_data["topic"]
+    words_used = session_data["words_used"]
+    level      = session_data["level"]
+    bot.send_message(chat_id,
+        f"Speaking practice -- {topic}\n\n"
+        f"5 questions based on the text. Answer by voice.\n"
+        f"Focus on using the target expressions flexibly. Let's go!")
+    bot.send_message(chat_id, "Generating questions...")
+    questions = generate_speaking_questions(topic, words_used, level, speak_lang)
+    if not questions:
+        bot.send_message(chat_id, "Could not generate questions. Please try again.")
+        return
+    if user_id not in user_sessions:
+        user_sessions[user_id] = UserSession()
+    s = user_sessions[user_id]
+    s.speak_questions = questions
+    s.speak_index = 0
+    s.speak_lang = speak_lang
+    s.awaiting_speak_lang = False
+    send_speak_question(chat_id, s)
+
+@bot.message_handler(content_types=["voice"])
+def handle_voice(message):
+    user_id = message.from_user.id
+    s = user_sessions.get(user_id)
+    if not s or not s.speak_questions:
+        bot.reply_to(message, "Use /speak to start speaking practice first.")
+        return
+    bot.send_chat_action(message.chat.id, "typing")
+    file_info = bot.get_file(message.voice.file_id)
+    downloaded = bot.download_file(file_info.file_path)
+    voice_path = f"/tmp/voice_{user_id}_{int(time.time())}.ogg"
+    with open(voice_path, "wb") as f:
+        f.write(downloaded)
+    user_text = transcribe_voice_stt(voice_path, s.speak_lang or "en")
+    os.remove(voice_path)
+    if not user_text:
+        bot.reply_to(message, "Could not understand the audio -- please try again.")
+        return
+    idx = s.speak_index
+    q   = s.speak_questions[idx]
+    feedback = generate_speaking_feedback(
+        question=q["question"],
+        target_expressions=q.get("target_expressions", []),
+        user_text=user_text,
+        level=getattr(s, "level", "B2") or "B2",
+        language=s.speak_lang or "en"
+    )
+    bot.send_message(message.chat.id, f"You said: \"{user_text}\"\n\n{feedback}")
+    s.speak_index += 1
+    if s.speak_index < len(s.speak_questions):
+        send_speak_question(message.chat.id, s)
+    else:
+        bot.send_message(message.chat.id, "All done! Great practice.\n\nSend a new vocabulary list any time.")
+        s.speak_questions = []
+        s.speak_index = 0
 
 
 if __name__ == '__main__':
