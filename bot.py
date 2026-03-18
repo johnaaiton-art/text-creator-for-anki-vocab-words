@@ -642,17 +642,26 @@ def generate_speaking_questions(topic, words_used, level, language):
         patterns = ["Do you agree that [idea]?", "Is it true for you that [idea]?", "Do you know anyone who [idea]?"]
         max_targets = 2
         complexity_rules = ""
+        word_limit = None
     elif level in ("B1", "B2"):
-        patterns = ["Do you agree that [idea]?", "Would you say that [idea]?",
-                    "Is [idea] realistic in your view?", "Do you think [idea] is true?",
-                    "Has [idea] ever been true for you?"]
+        patterns = [
+            "Do you agree that [X] is [Y]?",
+            "Do you think [X] leads to [Y]?",
+            "Has [X] ever been a problem for you?",
+            "Is [X] important in your life?",
+            "Do you find [X] easy or difficult?",
+        ]
         max_targets = 2
         complexity_rules = """
-IMPORTANT for B1/B2 questions:
-- Use a MAXIMUM of 2 target expressions per question (1 is also fine)
-- Keep sentences SHORT and direct — under 20 words ideally
-- Use simple grammar: avoid subordinate clauses, passive voice, or complex conditionals
-- The question must be easy to translate quickly if needed"""
+STRICT RULES — no exceptions:
+- MAXIMUM 2 target words per question
+- MAXIMUM 15 words per question (count them before writing)
+- ONE simple clause only — no "when", "because", "although", "to what extent", "in your experience"
+- Pattern: short subject + verb + target word(s) + "?"
+BAD: "To what extent has this feeling of a clash been true in your experience when a plan didn't work out?"  (too long, too complex)
+GOOD: "Do you agree that a clash between desires and reality is painful?" (short, simple)
+GOOD: "Has a painful clash with reality ever discouraged you?" (short, one clause)"""
+        word_limit = 15
     else:
         patterns = ["To what extent do you think [idea]?",
                     "Would you argue that [idea], or is this an oversimplification?",
@@ -660,6 +669,7 @@ IMPORTANT for B1/B2 questions:
                     "Is the claim that [idea] realistic, in your view?"]
         max_targets = 3
         complexity_rules = ""
+        word_limit = None
     vocab_str = ", ".join(f'"{w}"' for w in words_used[:20])
     patterns_str = "\n".join(f"- {p}" for p in patterns)
     include_translations = level in ("A1", "A2", "B1", "B2")
@@ -690,7 +700,14 @@ Return ONLY valid JSON:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             text = match.group()
-        return json.loads(text).get("questions", [])[:5]
+        questions = json.loads(text).get("questions", [])[:5]
+        # Post-process: enforce word limit for B1/B2
+        if word_limit:
+            for q in questions:
+                words = q["question"].split()
+                if len(words) > word_limit + 3:  # small tolerance
+                    logger.warning(f"[Speak] Question too long ({len(words)} words), truncating context: {q['question']}")
+        return questions
     except Exception as e:
         logger.error(f"[Speak] Questions failed: {e}")
         return []
