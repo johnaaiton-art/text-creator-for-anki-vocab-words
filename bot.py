@@ -640,30 +640,45 @@ def generate_speaking_questions(topic, words_used, level, language):
     lang_name = lang_names.get(language, "English")
     if level in ("A1", "A2"):
         patterns = ["Do you agree that [idea]?", "Is it true for you that [idea]?", "Do you know anyone who [idea]?"]
+        max_targets = 2
+        complexity_rules = ""
     elif level in ("B1", "B2"):
-        patterns = ["Do you agree that [idea]?", "To what extent has [idea] been true in your experience?",
-                    "Would you say that [idea]?", "Is [idea] realistic in your view?"]
+        patterns = ["Do you agree that [idea]?", "Would you say that [idea]?",
+                    "Is [idea] realistic in your view?", "Do you think [idea] is true?",
+                    "Has [idea] ever been true for you?"]
+        max_targets = 2
+        complexity_rules = """
+IMPORTANT for B1/B2 questions:
+- Use a MAXIMUM of 2 target expressions per question (1 is also fine)
+- Keep sentences SHORT and direct — under 20 words ideally
+- Use simple grammar: avoid subordinate clauses, passive voice, or complex conditionals
+- The question must be easy to translate quickly if needed"""
     else:
         patterns = ["To what extent do you think [idea]?",
                     "Would you argue that [idea], or is this an oversimplification?",
                     "How far has [idea] been true in your own experience?",
                     "Is the claim that [idea] realistic, in your view?"]
+        max_targets = 3
+        complexity_rules = ""
     vocab_str = ", ".join(f'"{w}"' for w in words_used[:20])
     patterns_str = "\n".join(f"- {p}" for p in patterns)
+    include_translations = level in ("A1", "A2", "B1", "B2")
+    translations_schema = ', "translations": {"expr1": "russian translation"}' if include_translations else ""
     prompt = f"""You are a language speaking coach for a {level} {lang_name} learner.
 Topic: {topic}
 Target expressions: {vocab_str}
 
 Create exactly 5 speaking questions in {lang_name}. Each must:
 1. React to a SPECIFIC idea from the text (not a tangent)
-2. Use 1-3 target expressions naturally inside the question
+2. Use {max_targets} target expressions MAX naturally inside the question
 3. Be appropriate for {level} level
 4. Use one of these patterns:
 {patterns_str}
 5. Prompt a personal reaction, not just yes/no
+{complexity_rules}
 
 Return ONLY valid JSON:
-{{"questions": [{{"question": "...", "target_expressions": ["expr1"]}}]}}"""
+{{"questions": [{{"question": "...", "target_expressions": ["expr1"]{translations_schema}}}]}}"""
     try:
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
@@ -745,10 +760,22 @@ def send_speak_question(chat_id, session):
         return
     q = qs[idx]
     targets = q.get("target_expressions", [])
+    translations = q.get("translations", {})
+
+    # Build target line: word (перевод) for each target that has a translation
+    target_parts = []
+    for t in targets:
+        ru = translations.get(t, "")
+        if ru:
+            target_parts.append(f"{t} ({ru})")
+        else:
+            target_parts.append(t)
+    target_line = "\n".join(target_parts)
+
     bot.send_message(chat_id,
         f"Question {idx+1}/{len(qs)}\n\n"
         f"\U0001f4ac {q['question']}\n\n"
-        f"\U0001f3af Target: {', '.join(targets)}\n\n"
+        f"\U0001f3af Target:\n{target_line}\n\n"
         f"Reply with a voice message \U0001f3a4"
     )
 
