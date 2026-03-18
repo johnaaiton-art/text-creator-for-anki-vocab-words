@@ -701,29 +701,60 @@ Return ONLY valid JSON:
         if match:
             text = match.group()
         questions = json.loads(text).get("questions", [])[:5]
-        # Hard-enforce max 2 targets in Python — don't trust the LLM
-        if max_targets == 2:
+
+        # Hard-enforce constraints for B1/B2 — rewrite any bad question
+        if level in ("B1", "B2"):
+            fixed = []
             for q in questions:
-                q["target_expressions"] = q.get("target_expressions", [])[:2]
-        # If translations missing, fetch them in a single follow-up call
+                targets = q.get("target_expressions", [])[:2]
+                q_text = q.get("question", "")
+                word_count = len(q_text.split())
+                target_count_in_q = sum(1 for t in q.get("target_expressions", []) if t.lower() in q_text.lower())
+                needs_rewrite = word_count > 18 or target_count_in_q > 2
+                if needs_rewrite:
+                    try:
+                        rw_prompt = (
+                            f"Rewrite this question for a {level} English learner.\n"
+                            f"Original: {q_text}\n"
+                            f"Use ONLY these 1-2 target words: {', '.join(targets)}\n"
+                            f"Rules: max 15 words, one simple clause, no subordinate clauses.\n"
+                            f"Return ONLY the rewritten question, nothing else."
+                        )
+                        rw_resp = deepseek_client.chat.completions.create(
+                            model="deepseek-chat",
+                            messages=[{"role": "user", "content": rw_prompt}],
+                            temperature=0.3, timeout=15.0
+                        )
+                        q["question"] = rw_resp.choices[0].message.content.strip().strip('"')
+                        logger.info(f"[Speak] Rewrote question: {q_text!r} -> {q['question']!r}")
+                    except Exception as rwe:
+                        logger.warning(f"[Speak] Rewrite failed: {rwe}")
+                q["target_expressions"] = targets
+                fixed.append(q)
+            questions = fixed
+
+        # Always rebuild translations to match the final target list exactly
         if include_translations:
             for q in questions:
-                if not q.get("translations"):
-                    targets_to_translate = q.get("target_expressions", [])
-                    if targets_to_translate:
-                        try:
-                            tr_prompt = f"Translate these English words/phrases to Russian. Return ONLY a JSON object like {{\"word\": \"перевод\"}}. Words: {', '.join(targets_to_translate)}"
-                            tr_resp = deepseek_client.chat.completions.create(
-                                model="deepseek-chat",
-                                messages=[{"role": "user", "content": tr_prompt}],
-                                temperature=0.1, timeout=15.0
-                            )
-                            tr_text = tr_resp.choices[0].message.content.strip()
-                            tr_match = re.search(r"\{.*\}", tr_text, re.DOTALL)
-                            if tr_match:
-                                q["translations"] = json.loads(tr_match.group())
-                        except Exception as te:
-                            logger.warning(f"[Speak] Translation fallback failed: {te}")
+                targets_needed = q.get("target_expressions", [])
+                existing = q.get("translations", {})
+                missing = [t for t in targets_needed if t not in existing]
+                if missing:
+                    try:
+                        tr_prompt = f"Translate these English words/phrases to Russian. Return ONLY a JSON object like {{\"word\": \"перевод\"}}. Words: {', '.join(targets_needed)}"
+                        tr_resp = deepseek_client.chat.completions.create(
+                            model="deepseek-chat",
+                            messages=[{"role": "user", "content": tr_prompt}],
+                            temperature=0.1, timeout=15.0
+                        )
+                        tr_text = tr_resp.choices[0].message.content.strip()
+                        tr_match = re.search(r"\{.*\}", tr_text, re.DOTALL)
+                        if tr_match:
+                            q["translations"] = json.loads(tr_match.group())
+                    except Exception as te:
+                        logger.warning(f"[Speak] Translation fetch failed: {te}")
+                else:
+                    q["translations"] = {t: existing[t] for t in targets_needed if t in existing}
         return questions
     except Exception as e:
         logger.error(f"[Speak] Questions failed: {e}")
