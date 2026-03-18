@@ -701,12 +701,29 @@ Return ONLY valid JSON:
         if match:
             text = match.group()
         questions = json.loads(text).get("questions", [])[:5]
-        # Post-process: enforce word limit for B1/B2
-        if word_limit:
+        # Hard-enforce max 2 targets in Python — don't trust the LLM
+        if max_targets == 2:
             for q in questions:
-                words = q["question"].split()
-                if len(words) > word_limit + 3:  # small tolerance
-                    logger.warning(f"[Speak] Question too long ({len(words)} words), truncating context: {q['question']}")
+                q["target_expressions"] = q.get("target_expressions", [])[:2]
+        # If translations missing, fetch them in a single follow-up call
+        if include_translations:
+            for q in questions:
+                if not q.get("translations"):
+                    targets_to_translate = q.get("target_expressions", [])
+                    if targets_to_translate:
+                        try:
+                            tr_prompt = f"Translate these English words/phrases to Russian. Return ONLY a JSON object like {{\"word\": \"перевод\"}}. Words: {', '.join(targets_to_translate)}"
+                            tr_resp = deepseek_client.chat.completions.create(
+                                model="deepseek-chat",
+                                messages=[{"role": "user", "content": tr_prompt}],
+                                temperature=0.1, timeout=15.0
+                            )
+                            tr_text = tr_resp.choices[0].message.content.strip()
+                            tr_match = re.search(r"\{.*\}", tr_text, re.DOTALL)
+                            if tr_match:
+                                q["translations"] = json.loads(tr_match.group())
+                        except Exception as te:
+                            logger.warning(f"[Speak] Translation fallback failed: {te}")
         return questions
     except Exception as e:
         logger.error(f"[Speak] Questions failed: {e}")
